@@ -874,3 +874,25 @@ Note that some event names appear in multiple contracts. When indexing, filter b
 - [THREAT_MODEL.md](./THREAT_MODEL.md) — trust assumptions and auth gates
 - [STORAGE.md](./STORAGE.md) — on-chain data layout and TTL patterns
 - [LIMITATIONS.md](./LIMITATIONS.md) — known gaps and testnet constraints
+
+## Golden XDR regression fixtures
+
+`tests/integration/fixtures/event-xdr.tsv` pins topics and data as hexadecimal
+serialized `ScVal` values for each emitter in invoice, registry, pool, escrow and
+pool_factory. `event_golden.rs` invokes the real emitter source in a contract
+context and compares both payloads byte for byte. The emitting contract ID is
+checked separately and is not part of the topics payload.
+
+Inputs are fixed in each case: contract StrKeys have distinct repeated-byte IDs,
+BytesN values have 32 repeated bytes, and u128 values exceed u64::MAX to exercise
+both halves. Addresses are synthetic test contracts, not deployed Mainnet assets.
+Amount fields remain raw contract integers; fixtures do not assume token decimals.
+A TSV row contains `contract.event`, topics XDR hex, then data XDR hex. `SCV_VEC`
+is tag 16, symbols are tag 15, u128 is tag 9, and void is tag 1. Decode with the
+Stellar XDR ScVal schema before interpreting event-specific fields.
+
+Run `cargo test -p clearledger-integration-tests --test event_golden`. Any schema
+change requires reviewing and updating the fixture and corresponding event docs;
+tests never regenerate expected bytes. These emitter-level tests complement
+workflow coverage: they do not prove that every entry point emits the right event
+or that every legacy schema is acceptable to all deployed network versions.
