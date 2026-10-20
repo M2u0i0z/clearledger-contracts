@@ -33,10 +33,15 @@ pub const MAX_FACE_VALUE: u128 = u128::MAX / 10_000;
 /// in the future). The value is ~10 years (10 * 365 * 24 * 60 * 60).
 pub const MAX_INVOICE_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
-/// Fixed 32-byte domain separator that Underwrite agents must include in
-/// the [`AttestationPayload`] they sign. Binds a signature to this
-/// contract's attestation scheme specifically, so it can't be replayed
-/// against an unrelated contract or message format.
+/// Stable 32-byte protocol tag for ClearLedger invoice attestations.
+///
+/// This is mixed into the effective domain separator returned by
+/// [`InvoiceContract::get_attestation_domain_separator`]. Agents must put
+/// that returned value — not this raw tag — into
+/// [`AttestationPayload::domain_separator`]. The effective separator is
+/// `SHA-256(tag || network_id || contract_id_xdr)`, which binds a signature
+/// to this attestation scheme, the current Stellar network, and this exact
+/// invoice contract deployment.
 pub const ATTESTATION_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceAttest.v1____";
 
 /// Maximum number of invoices a single paginated `get_by_*` query may return.
@@ -1160,6 +1165,61 @@ impl InvoiceContract {
         true
     }
 
+    /// Returns the effective domain separator that Underwrite agents must
+    /// place in [`AttestationPayload::domain_separator`] before signing.
+    ///
+    /// It is computed as
+    /// `SHA-256(ATTESTATION_DOMAIN_SEPARATOR || network_id || contract_id_xdr)`,
+    /// where:
+    ///
+    /// * `ATTESTATION_DOMAIN_SEPARATOR` is the fixed ClearLedger scheme tag
+    ///   (`ClearLedger.InvoiceAttest.v1____`).
+    /// * `network_id` is the 32-byte value returned by
+    ///   [`soroban_sdk::ledger::Ledger::network_id`], i.e. `SHA-256` of the
+    ///   Stellar network passphrase (`Test SDF Network ; September 2015` on
+    ///   testnet, `Public Global Stellar Network ; September 2015` on
+    ///   mainnet). Binding it prevents an attestation signed for one network
+    ///   from being accepted on another.
+    /// * `contract_id_xdr` is this contract's address encoded as XDR.
+    ///   Binding it prevents a signature from being replayed against another
+    ///   invoice-contract deployment. Soroban contract IDs are themselves
+    ///   derived with the network ID, so this is an additional, explicit
+    ///   contract-level binding rather than a replacement for the network
+    ///   one.
+    ///
+    /// Agents should call this view against the invoice contract they intend
+    /// to attest to instead of hard-coding a separator.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// Does not panic.
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The domain separator to include in the signed payload.
+    pub fn get_attestation_domain_separator(env: Env) -> BytesN<32> {
+        Self::attestation_domain_separator(&env)
+    }
+
+    /// Computes the effective domain separator described on
+    /// [`Self::get_attestation_domain_separator`].
+    fn attestation_domain_separator(env: &Env) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        for byte in ATTESTATION_DOMAIN_SEPARATOR.iter() {
+            preimage.push_back(*byte);
+        }
+        let network_id = env.ledger().network_id();
+        for byte in network_id.to_array() {
+            preimage.push_back(byte);
+        }
+        let contract_id = env.current_contract_address().to_xdr(env);
+        for byte in contract_id.iter() {
+            preimage.push_back(byte);
+        }
+        env.crypto().sha256(&preimage).into()
+    }
+
     /// Submits a signed risk attestation from a registered Underwrite agent
     /// against an invoice, unlocking it for `list_for_financing`.
     ///
@@ -1183,6 +1243,46 @@ impl InvoiceContract {
     /// None from the caller — submission is deliberately permissionless.
     /// Trust comes entirely from the signature recovering to an active
     /// agent's registered pubkey, not from who relays the transaction.
+    ///
+    /// # Signed preimage and replay / domain binding
+    ///
+    /// The signed preimage is exactly the XDR encoding of
+    /// [`AttestationPayload`]:
+    ///
+    /// ```text
+    /// domain_separator (BytesN<32>)
+    /// invoice_id       (BytesN<32>)
+    /// risk_score       (u32)
+    /// evidence_hash    (BytesN<32>)
+    /// agent_id         (Symbol)
+    /// nonce            (u64)
+    /// ```
+    ///
+    /// The digest is `keccak256(payload)` and the 65-byte signature is
+    /// `r || s || recovery_id`, so every field is cryptographically bound:
+    ///
+    /// * **Network + contract** — `domain_separator` must equal
+    ///   [`Self::get_attestation_domain_separator`], a hash over the scheme
+    ///   tag, `ledger.network_id()` (the network passphrase hash), and this
+    ///   contract's id. A signature made for another network or another
+    ///   invoice-contract deployment is rejected.
+    /// * **Invoice** — `invoice_id` must equal the `invoice_id` argument.
+    /// * **Agent identity** — `agent_id` is looked up in the configured
+    ///   agent registry, and the recovered pubkey must equal the registered
+    ///   active agent's pubkey. Changing the claimed agent changes the
+    ///   digest (and/or fails the pubkey match).
+    /// * **Nonce** — included in the digest, so reusing a signature with a
+    ///   different nonce recovers a different key and is rejected. There is
+    ///   deliberately no per-agent nonce ledger: the one-attestation-per-
+    ///   invoice storage guard is the on-chain replay guard, so distinct
+    ///   nonces cannot authorize a second attestation for the same invoice.
+    /// * **Risk data** — `risk_score` and `evidence_hash` are signed too;
+    ///   changing either invalidates the signature.
+    ///
+    /// The trust boundary is therefore: *anyone* may submit, but only a
+    /// signature produced by an agent whose registered pubkey matches the
+    /// recovered key, for this exact network, contract, invoice, risk data,
+    /// agent id, and nonce, can create the single stored attestation.
     ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the invoice does not exist, or if the
@@ -1224,7 +1324,7 @@ impl InvoiceContract {
 
         let decoded: AttestationPayload = AttestationPayload::from_xdr(&env, &payload)
             .unwrap_or_else(|_| panic_with_error!(&env, InvoiceError::InvalidAmount));
-        if decoded.domain_separator != BytesN::from_array(&env, &ATTESTATION_DOMAIN_SEPARATOR) {
+        if decoded.domain_separator != Self::attestation_domain_separator(&env) {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
         }
         if decoded.invoice_id != invoice_id {

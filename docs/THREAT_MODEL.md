@@ -182,6 +182,32 @@ advances, the previous function cannot be called again.
 Additionally, escrow's `lock()` function rejects re-locking an already-locked
 invoice with `EscrowError::AlreadyLocked`.
 
+#### Attestation replay and domain separation
+
+`submit_attestation` is permissionless, so the signed payload is the entire
+trust boundary. The signed preimage is the XDR `AttestationPayload`
+(`domain_separator`, `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`,
+`nonce`), hashed with keccak256 and signed with secp256k1. Verification
+requires:
+
+- the effective domain separator
+  `SHA-256(tag || ledger.network_id() || contract_address.to_xdr())`, which
+  binds the scheme, the Stellar network passphrase hash, and this exact
+  invoice-contract deployment;
+- the payload's `invoice_id` to equal the submitted invoice id;
+- the recovered pubkey to equal the active agent's registered pubkey for the
+  payload's `agent_id`; and
+- no attestation to be stored yet for that invoice.
+
+Consequences: a signature cannot be moved to another invoice, another
+network, another invoice-contract deployment, another nonce, or another agent
+identity. Changing any signed field invalidates the signature, and the
+one-attestation-per-invoice storage check blocks byte-for-byte replay. The
+nonce is signed but is **not** a per-agent replay ledger; distinct nonces do
+not permit a second attestation for the same invoice. The full wire format,
+migration note, and resource profile are in
+[ATTESTATIONS.md](./ATTESTATIONS.md).
+
 ### 5. Integer Over/Underflow
 
 **Risk:** Arithmetic errors in amount calculations could lead to incorrect

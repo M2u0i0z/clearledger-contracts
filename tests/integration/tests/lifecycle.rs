@@ -243,10 +243,7 @@ fn test_agent_id(env: &Env) -> Symbol {
 
 fn attest_invoice(env: &Env, invoice_client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     let payload = clearledger_invoice::AttestationPayload {
-        domain_separator: BytesN::from_array(
-            env,
-            &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-        ),
+        domain_separator: invoice_client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9u8; 32]),

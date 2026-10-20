@@ -113,10 +113,7 @@ pub struct AgentKey(Symbol);
 /// `list_for_financing`.
 fn attest_invoice(te: &TestEnv, invoice_id: &BytesN<32>) {
     let payload = clearledger_invoice::AttestationPayload {
-        domain_separator: BytesN::from_array(
-            &te.env,
-            &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-        ),
+        domain_separator: te.invoice.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&te.env, &[9u8; 32]),
@@ -3786,10 +3783,7 @@ mod real_registry_integration {
         let invoice_id = invoice.create(&issuer, &buyer, &face_value, &due_date, &usdc_id);
 
         let payload = clearledger_invoice::AttestationPayload {
-            domain_separator: BytesN::from_array(
-                &env,
-                &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-            ),
+            domain_separator: invoice.get_attestation_domain_separator(),
             invoice_id: invoice_id.clone(),
             risk_score: 5000,
             evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
@@ -3854,10 +3848,7 @@ mod real_registry_integration {
         let second_invoice_id =
             invoice.create(&issuer, &buyer, &face_value, &second_due_date, &usdc_id);
         let second_payload = clearledger_invoice::AttestationPayload {
-            domain_separator: BytesN::from_array(
-                &env,
-                &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-            ),
+            domain_separator: invoice.get_attestation_domain_separator(),
             invoice_id: second_invoice_id.clone(),
             risk_score: 5000,
             evidence_hash: BytesN::from_array(&env, &[8u8; 32]),

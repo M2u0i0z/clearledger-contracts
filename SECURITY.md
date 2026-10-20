@@ -66,6 +66,7 @@ A security audit is planned prior to any mainnet deployment.
 ## Further Reading
 
 - [Threat Model](./docs/THREAT_MODEL.md) — detailed trust assumptions, auth gates, and attack vectors
+- [Attestation Signing](./docs/ATTESTATIONS.md) — signed preimage, network/contract domain separation, and replay boundary for Underwrite attestations
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout and TTL management
 - [Limitations](./docs/LIMITATIONS.md) — known gaps, testnet constraints, and unhandled edge cases
 

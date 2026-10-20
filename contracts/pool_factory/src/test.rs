@@ -700,10 +700,7 @@ fn attest_invoice(env: &Env, invoice: &InvoiceContractClient, invoice_id: &Bytes
     invoice.set_agent_registry_contract(&agent_registry_id);
 
     let payload = clearledger_invoice::AttestationPayload {
-        domain_separator: BytesN::from_array(
-            env,
-            &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-        ),
+        domain_separator: invoice.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9; 32]),

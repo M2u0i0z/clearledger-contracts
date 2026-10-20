@@ -8,7 +8,7 @@ use soroban_sdk::{
     testutils::{storage::Persistent as _, Address as _, Events as _, Ledger},
     token,
     xdr::ToXdr,
-    Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Vec,
 };
 
 use crate::{
@@ -287,7 +287,7 @@ fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9u8; 32]),
@@ -305,6 +305,54 @@ fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     let signature = BytesN::from_array(env, &sig_bytes);
 
     client.submit_attestation(invoice_id, &payload_bytes, &signature);
+}
+
+/// Registers the shared test secp256k1 key as an active agent and points
+/// `client` at the fresh mock registry.
+fn register_test_agent(env: &Env, client: &InvoiceContractClient) -> Symbol {
+    let agent_id = Symbol::new(env, "test_agent");
+    let registry_id = env.register_contract(None, MockAgentRegistry);
+    let registry_client = MockAgentRegistryClient::new(env, &registry_id);
+    registry_client.register_agent(
+        &agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(env),
+        },
+    );
+    client.set_agent_registry_contract(&registry_id);
+    agent_id
+}
+
+/// Signs `payload` exactly as an off-chain agent would: keccak256 over the
+/// XDR bytes, then a recoverable secp256k1 signature over that digest.
+fn sign_attestation(env: &Env, payload: &crate::AttestationPayload) -> (Bytes, BytesN<65>) {
+    let payload_bytes = payload.to_xdr(env);
+    let digest = env.crypto().keccak256(&payload_bytes).to_array();
+    let (sig, recid) = test_agent_signing_key()
+        .sign_prehash_recoverable(&digest)
+        .unwrap();
+    let mut sig_bytes = [0u8; 65];
+    sig_bytes[..64].copy_from_slice(&sig.to_bytes());
+    sig_bytes[64] = recid.to_byte();
+    (payload_bytes, BytesN::from_array(env, &sig_bytes))
+}
+
+fn test_payload(
+    env: &Env,
+    client: &InvoiceContractClient,
+    invoice_id: &BytesN<32>,
+    agent_id: &Symbol,
+    nonce: u64,
+) -> crate::AttestationPayload {
+    crate::AttestationPayload {
+        domain_separator: client.get_attestation_domain_separator(),
+        invoice_id: invoice_id.clone(),
+        risk_score: 5000,
+        evidence_hash: BytesN::from_array(env, &[9u8; 32]),
+        agent_id: agent_id.clone(),
+        nonce,
+    }
 }
 
 // ============== FAILURE-PATH TESTS FOR submit_attestation ==============
@@ -333,7 +381,7 @@ fn test_submit_attestation_untrusted_signer_wrong_pubkey() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
@@ -377,7 +425,7 @@ fn test_submit_attestation_inactive_agent() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
@@ -412,7 +460,7 @@ fn test_submit_attestation_unregistered_agent() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
@@ -456,7 +504,7 @@ fn test_submit_attestation_replay_rejection() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 6000,
         evidence_hash: BytesN::from_array(&env, &[10u8; 32]),
@@ -545,7 +593,7 @@ fn test_submit_attestation_invoice_id_mismatch() {
     // Different invoice_id in payload vs argument
     let wrong_invoice_id = BytesN::from_array(&env, &[1u8; 32]);
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: wrong_invoice_id,
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
@@ -563,6 +611,221 @@ fn test_submit_attestation_invoice_id_mismatch() {
     let signature = BytesN::from_array(&env, &sig_bytes);
 
     client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+// ============== REPLAY / DOMAIN-SEPARATION TESTS ==============
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_submit_attestation_same_signature_cannot_be_replayed() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    // Byte-for-byte replay of the accepted submission.
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_rejects_legacy_fixed_domain_separator() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Pre-#117 clients used the raw scheme tag as the separator. It carries
+    // no network or contract binding and must no longer verify.
+    let mut payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    payload.domain_separator = BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_invoices() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_a = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let invoice_b = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Signed for invoice A; try to spend it on invoice B.
+    let payload = test_payload(&env, &client, &invoice_a, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_b, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_networks() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    // The separator commits to ledger.network_id() (the network passphrase
+    // hash). Same contract, same invoice, but a different network must reject
+    // the signature produced for the original network.
+    env.ledger().set_network_id([2u8; 32]);
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_contracts() {
+    let (env, client, issuer, buyer, registry_client, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // A second invoice contract on the same network. Invoice IDs are
+    // deterministic from terms + counter, so identical terms produce the same
+    // invoice id here; only the contract-level domain binding distinguishes
+    // the two deployments.
+    let second_contract_id = env.register_contract(None, InvoiceContract);
+    let second = InvoiceContractClient::new(&env, &second_contract_id);
+    let second_admin = Address::generate(&env);
+    second.initialize(&second_admin, &registry_client.address);
+    second.add_supported_asset(&usdc);
+    second.set_agent_registry_contract(&client.get_agent_registry_contract().unwrap());
+    let second_invoice_id =
+        second.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_eq!(second_invoice_id, invoice_id);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    // Signature covers the first contract's domain; replaying the same bytes
+    // against the second deployment must fail.
+    second.submit_attestation(&second_invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_not_reusable_with_wrong_nonce() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let signed_payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    // Reuse the nonce-1 signature after mutating the payload's nonce.
+    let tampered_payload = test_payload(&env, &client, &invoice_id, &agent_id, 2);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_bound_to_agent_identity() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+    let other_agent_id = Symbol::new(&env, "other_agent");
+
+    // Give the other agent the same registered key: the only difference is
+    // the agent_id claimed inside the signed payload.
+    let registry_id = client.get_agent_registry_contract().unwrap();
+    let registry_client = MockAgentRegistryClient::new(&env, &registry_id);
+    registry_client.register_agent(
+        &other_agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(&env),
+        },
+    );
+
+    let signed_payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    let tampered_payload = test_payload(&env, &client, &invoice_id, &other_agent_id, 1);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
+}
+
+#[test]
+fn test_submit_attestation_rejects_malformed_payload() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &payload);
+
+    let malformed = Bytes::from_slice(&env, &[0xff; 8]);
+    let result = client.try_submit_attestation(&invoice_id, &malformed, &signature);
+    assert!(result.is_err(), "malformed payload must be rejected");
+}
+
+#[test]
+fn test_submit_attestation_rejects_invalid_signature() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let payload_bytes = payload.to_xdr(&env);
+
+    let zero_signature = BytesN::from_array(&env, &[0u8; 65]);
+    let zero_result = client.try_submit_attestation(&invoice_id, &payload_bytes, &zero_signature);
+    assert!(zero_result.is_err(), "zero signature must be rejected");
+
+    let (_, signature) = sign_attestation(&env, &payload);
+    let mut bad_recovery = signature.to_array();
+    bad_recovery[64] = 4;
+    let bad_recovery_signature = BytesN::from_array(&env, &bad_recovery);
+    let recovery_result =
+        client.try_submit_attestation(&invoice_id, &payload_bytes, &bad_recovery_signature);
+    assert!(
+        recovery_result.is_err(),
+        "out-of-range recovery id must be rejected"
+    );
+}
+
+#[test]
+fn test_gas_benchmark_submit_attestation() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    env.budget().reset_default();
+    let cpu_before = env.budget().cpu_instruction_cost();
+    let mem_before = env.budget().memory_bytes_cost();
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    let cpu_after = env.budget().cpu_instruction_cost();
+    let mem_after = env.budget().memory_bytes_cost();
+
+    let cpu_delta = cpu_after - cpu_before;
+    let mem_delta = mem_after - mem_before;
+    assert!(cpu_delta > 0);
+    assert!(mem_delta > 0);
+    std::eprintln!(
+        "\n== GAS BENCHMARK ==\nsubmit_attestation(): CPU instructions: {}, Memory bytes: {}\n=====",
+        cpu_delta,
+        mem_delta
+    );
 }
 
 #[test]
@@ -595,7 +858,7 @@ fn test_submit_attestation_nonexistent_invoice() {
 
     let fake_invoice_id = BytesN::from_array(&env, &[1u8; 32]);
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: fake_invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
@@ -4121,7 +4384,7 @@ fn attest_no_mock_auth(env: &Env, client: &InvoiceContractClient, invoice_id: &B
     );
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9u8; 32]),

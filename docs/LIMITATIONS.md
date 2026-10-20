@@ -70,6 +70,7 @@ relative costs based on code analysis.
 | `registry::list_profiles` | 0 | 0 | — | — | Low (O(limit), ≤ 50) |
 | `invoice::create` | 2 (`is_verified` ×2) | 0 | — | — | Low |
 | `invoice::batch_create` | 2 per entry (`is_verified` ×2) | 0 | — | — | Low per entry, **up to 50× `create`** |
+| `invoice::submit_attestation` | 1 (`get_agent`) | 0 | — | — | Medium (domain + payload hashes + secp256k1 recovery) |
 | `invoice::list_for_financing` | 0 | 0 | — | — | Low |
 | `invoice::batch_list_for_financing` | 0 | 0 | — | — | Low per entry, **up to 50× `list_for_financing`** |
 | `invoice::mark_funded` | 0 | 0 | — | — | Low |
